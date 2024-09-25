@@ -53,6 +53,7 @@ def forward_with_rerope(
     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    # position_ids: [batch_size, sequence_length]
     query_states *= ((position_ids + 1)[:, None, :, None].log() / np.log(training_length)).clip(1).to(query_states.dtype)
 
     kv_seq_len = key_states.shape[-2]
@@ -61,31 +62,34 @@ def forward_with_rerope(
         # reuse k, v, self_attention
         key_states = torch.cat([past_key_value[0], key_states], dim=2)
         value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        # position_ids: [batch_size, sequence_length]
         position_ids = torch.cat([past_key_value[2], position_ids], dim=1)
 
     past_key_value = (key_states, value_states, position_ids) if use_cache else None
     
-    if q_len == 1:
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    if q_len == 1: # 第一次计算时
+        cos, sin = self.rotary_emb.forward(value_states, seq_len=kv_seq_len)
         position_ids = (position_ids[:, -1:] - position_ids).clip(max=window)
         _, key_states = apply_rotary_pos_emb(None, key_states, cos, -sin, position_ids)
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
     else:
-        cos, sin = self.rotary_emb(value_states, seq_len=max(kv_seq_len, window + 1))
+        cos, sin = self.rotary_emb.forward(value_states, seq_len=max(kv_seq_len, window + 1))
         query_states1, key_states1 = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        query_states2, _ = apply_rotary_pos_emb(query_states, None, cos, sin, position_ids * 0 + window)
+        # 超过max_seq + window的位置统一按max_seq计算
+        query_states2, _ = apply_rotary_pos_emb(query_states, None, cos, sin, position_ids * 0 + window) # 最多只有window大小的相对位置
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states1 = repeat_kv(key_states1, self.num_key_value_groups)
         key_states2 = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights1 = torch.matmul(query_states1, key_states1.transpose(2, 3)) / math.sqrt(self.head_dim)
-        attn_weights2 = torch.matmul(query_states2, key_states2.transpose(2, 3)) / math.sqrt(self.head_dim)
-        rectified_mask = (position_ids[:, -q_len:, None] - position_ids[:, None]).abs() < window
-        attn_weights = torch.where(rectified_mask, attn_weights1, attn_weights2)
+        attn_weights_in_window = torch.matmul(query_states1, key_states1.transpose(2, 3)) / math.sqrt(self.head_dim) # 在max_seq + window内的
+        attn_weights_out_window = torch.matmul(query_states2, key_states2.transpose(2, 3)) / math.sqrt(self.head_dim) # 超过max_seq + window的统一设为max_seq+window
+        # position_ids: [batch_size, sequence_length]
+        rectified_mask_in_window = (position_ids[:, -q_len:, None] - position_ids[:, None]).abs() < window
+        attn_weights = torch.where(rectified_mask_in_window, attn_weights_in_window, attn_weights_out_window) # window内的
 
     if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
         raise ValueError(
